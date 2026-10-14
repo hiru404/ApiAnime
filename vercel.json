@@ -7,16 +7,22 @@
         { "key": "Access-Control-Allow-Methods", "value": "GET, OPTIONS" },
         { "key": "Access-Control-Allow-Headers", "value": "Content-Type" }
       ]
+    },
+    {
+      "source": "/api-animasu/(.*)",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "*" },
+        { "key": "Access-Control-Allow-Methods", "value": "GET, OPTIONS" },
+        { "key": "Access-Control-Allow-Headers", "value": "Content-Type" }
+      ]
     }
   ],
   "rewrites": [
-    { "source": "/home", "destination": "/api/home" },
-    { "source": "/detail/:slug", "destination": "/api/detail?slug=:slug" },
-    { "source": "/stream/:slug", "destination": "/api/stream?slug=:slug" }
+    { "source": "/api-animasu/:path*", "destination": "/api/:path*" }
   ],
   "functions": {
     "api/*.js": {
-      "maxDuration": 15
+      "maxDuration": 10
     }
   }
 }
