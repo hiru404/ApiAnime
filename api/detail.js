@@ -6,7 +6,34 @@ const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'id-ID,id;q=0.9,en;q=0.8',
-  'Referer': `${BASE}/`
+  'Referer': `${BASE}/`,
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'same-origin',
+  'Upgrade-Insecure-Requests': '1'
+};
+
+/*
+  Environment Variable (opsional, pilih salah satu):
+  - SCRAPER_KEY : API key ScraperAPI (https://www.scraperapi.com)
+  - PROXY_URL   : URL Cloudflare Worker proxy, contoh https://nama.xxx.workers.dev
+                  (Worker menerima ?slug=xxx dan mengembalikan HTML halaman detail)
+  Kalau keduanya kosong, fetch langsung ke sumber (rawan 403 di Vercel).
+*/
+const fetchSource = (slug) => {
+  const target = `${BASE}/anime/${slug}/`;
+
+  if (process.env.SCRAPER_KEY) {
+    return fetch(
+      `https://api.scraperapi.com/?api_key=${process.env.SCRAPER_KEY}&url=${encodeURIComponent(target)}`
+    );
+  }
+
+  if (process.env.PROXY_URL) {
+    return fetch(`${process.env.PROXY_URL}?slug=${encodeURIComponent(slug)}`);
+  }
+
+  return fetch(target, { headers: HEADERS });
 };
 
 const clean = (s = '') => s.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -50,7 +77,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const r = await fetch(`${BASE}/anime/${slug}/`, { headers: HEADERS });
+    const r = await fetchSource(slug);
 
     if (!r.ok) {
       const body = (await r.text()).slice(0, 300);
@@ -61,12 +88,24 @@ export default async function handler(req, res) {
         status: 'error',
         creator: 'hiru404',
         message: blocked
-          ? `Sumber membalas ${r.status}. Kemungkinan permintaan diblokir (Cloudflare/IP datacenter).`
+          ? `Sumber membalas ${r.status}. Kemungkinan permintaan diblokir (Cloudflare/IP datacenter). Set SCRAPER_KEY atau PROXY_URL di Environment Variables.`
           : `Sumber membalas ${r.status}`
       });
     }
 
-    const $ = load(await r.text());
+    const html = await r.text();
+
+    // halaman challenge Cloudflare kadang tetap berstatus 200
+    if (/Just a moment|challenge-platform|cf-chl/i.test(html.slice(0, 3000))) {
+      console.log('animasu detail: challenge Cloudflare terdeteksi');
+      return send(503, {
+        status: 'error',
+        creator: 'hiru404',
+        message: 'Sumber menampilkan challenge Cloudflare. Gunakan SCRAPER_KEY atau PROXY_URL.'
+      });
+    }
+
+    const $ = load(html);
     const big = $('.bigcontent').first();
     if (!big.length) {
       return send(502, {
