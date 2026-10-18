@@ -1,41 +1,102 @@
 import { load } from 'cheerio';
 
-const BASE = 'https://x6.sokuja.uk';
+/*
+  Environment Variable (semua opsional):
+  - SOKUJA_BASE      : domain sumber, default https://x6.sokuja.uk (ganti kalau mirror berubah)
+  - PROXY_URL        : URL Cloudflare Worker proxy (menerima ?slug=xxx, mengembalikan HTML)
+  - SCRAPER_KEY      : API key ScraperAPI
+  - SCRAPER_PREMIUM  : "1" -> tambahkan premium=true (proxy residensial, kredit lebih besar)
+  - SCRAPER_RENDER   : "1" -> tambahkan render=true (render JS, kredit lebih besar)
 
+  Urutan percobaan: PROXY_URL -> SCRAPER_KEY -> direct.
+  Kalau satu jalur kena 403/503/challenge Cloudflare, otomatis lanjut ke jalur berikutnya.
+
+  Contoh: /api/detail?slug=tsuihou-sareta-tensei-juukishi-wa-game-chishiki-de-musou-suru-subtitle-indonesia
+  Tambah &debug=1 untuk melihat jalur mana yang dicoba dan statusnya.
+*/
+const BASE = (process.env.SOKUJA_BASE || 'https://x6.sokuja.uk').replace(/\/+$/, '');
+const TIMEOUT_MS = 15000;
+
+// header navigasi langsung (bukan same-origin) supaya mirip browser asli
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Accept-Language': 'id-ID,id;q=0.9,en;q=0.8',
-  'Referer': `${BASE}/`,
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Cache-Control': 'max-age=0',
+  'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  'Sec-Ch-Ua-Mobile': '?0',
+  'Sec-Ch-Ua-Platform': '"Windows"',
   'Sec-Fetch-Dest': 'document',
   'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'same-origin',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
   'Upgrade-Insecure-Requests': '1'
 };
 
-/*
-  Environment Variable (opsional, pilih salah satu):
-  - SCRAPER_KEY : API key ScraperAPI (https://www.scraperapi.com)
-  - PROXY_URL   : URL Cloudflare Worker proxy, contoh https://nama.xxx.workers.dev
-                  (Worker menerima ?slug=xxx dan mengembalikan HTML halaman detail)
-  Kalau keduanya kosong, fetch langsung ke sumber (rawan 403 di Vercel).
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  Contoh: /api/detail?slug=tsuihou-sareta-tensei-juukishi-wa-game-chishiki-de-musou-suru-subtitle-indonesia
-*/
-const fetchSource = (slug) => {
+const isChallenge = (html = '') =>
+  /Just a moment|challenge-platform|cf-chl|cf_chl_opt/i.test(html.slice(0, 4000));
+
+const strategies = () => {
+  const list = [];
+  if (process.env.PROXY_URL) list.push('proxy');
+  if (process.env.SCRAPER_KEY) list.push('scraperapi');
+  list.push('direct');
+  return list;
+};
+
+const requestVia = (via, slug, signal) => {
   const target = `${BASE}/anime/${slug}/`;
 
-  if (process.env.SCRAPER_KEY) {
-    return fetch(
-      `https://api.scraperapi.com/?api_key=${process.env.SCRAPER_KEY}&url=${encodeURIComponent(target)}`
-    );
+  if (via === 'proxy') {
+    return fetch(`${process.env.PROXY_URL}?slug=${encodeURIComponent(slug)}`, { signal });
   }
 
-  if (process.env.PROXY_URL) {
-    return fetch(`${process.env.PROXY_URL}?slug=${encodeURIComponent(slug)}`);
+  if (via === 'scraperapi') {
+    const p = new URLSearchParams({ api_key: process.env.SCRAPER_KEY, url: target });
+    if (process.env.SCRAPER_PREMIUM === '1') p.set('premium', 'true');
+    if (process.env.SCRAPER_RENDER === '1') p.set('render', 'true');
+    return fetch(`https://api.scraperapi.com/?${p.toString()}`, { signal });
   }
 
-  return fetch(target, { headers: HEADERS });
+  return fetch(target, { headers: { ...HEADERS, Referer: `${BASE}/` }, signal });
+};
+
+// coba tiap jalur; 5xx/timeout dicoba ulang 1x, 403/503/challenge langsung pindah jalur
+const fetchHtml = async (slug) => {
+  const attempts = [];
+
+  for (const via of strategies()) {
+    for (let tries = 0; tries < 2; tries++) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+
+      try {
+        const r = await requestVia(via, slug, ctrl.signal);
+        const server = r.headers.get('server') || '';
+        const html = await r.text();
+        const challenge = isChallenge(html);
+        attempts.push({ via, status: r.status, server, challenge });
+
+        if (r.ok && !challenge) return { ok: true, html, via, attempts };
+
+        console.log('sokuja detail', via, r.status, 'server:', server, 'challenge:', challenge, 'body:', html.slice(0, 200));
+
+        const retryable = r.status >= 500 && r.status !== 503 && !challenge;
+        if (!retryable) break;
+      } catch (e) {
+        attempts.push({ via, status: 0, error: e.name === 'AbortError' ? 'timeout' : e.message });
+        console.log('sokuja detail', via, 'error:', e.message);
+      } finally {
+        clearTimeout(timer);
+      }
+
+      await sleep(400);
+    }
+  }
+
+  return { ok: false, attempts };
 };
 
 const clean = (s = '') => s.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -91,6 +152,8 @@ export default async function handler(req, res) {
   const send = (code, obj) => res.status(code).send(JSON.stringify(obj, null, 2));
 
   const slug = String(req.query.slug || '').trim().toLowerCase();
+  const debug = String(req.query.debug || '') === '1';
+
   if (!slug || !/^[a-z0-9-]+$/.test(slug)) {
     return send(400, {
       status: 'error',
@@ -100,42 +163,33 @@ export default async function handler(req, res) {
   }
 
   try {
-    const r = await fetchSource(slug);
+    const result = await fetchHtml(slug);
 
-    if (!r.ok) {
-      const body = (await r.text()).slice(0, 300);
-      console.log('sokuja detail', r.status, 'server:', r.headers.get('server'), 'body:', body);
+    if (!result.ok) {
+      const last = result.attempts[result.attempts.length - 1] || {};
+      const blocked = result.attempts.some(a => a.status === 403 || a.status === 503 || a.challenge);
+      const code = blocked ? (last.status === 503 ? 503 : 403) : (last.status || 502);
+      const tried = result.attempts.map(a => a.via).filter((v, i, arr) => arr.indexOf(v) === i);
 
-      const blocked = r.status === 403 || r.status === 503;
-      return send(r.status, {
+      return send(code, {
         status: 'error',
         creator: 'hiru404',
         message: blocked
-          ? `Sumber membalas ${r.status}. Kemungkinan permintaan diblokir (Cloudflare/IP datacenter). Set SCRAPER_KEY atau PROXY_URL di Environment Variables.`
-          : `Sumber membalas ${r.status}`
+          ? `Sumber memblokir permintaan (Cloudflare). Jalur dicoba: ${tried.join(', ')}. Pasang PROXY_URL atau SCRAPER_KEY (opsional SCRAPER_PREMIUM=1) lalu redeploy.`
+          : `Sumber tidak bisa diakses (status ${last.status || 'timeout'}). Jalur dicoba: ${tried.join(', ')}.`,
+        ...(debug ? { attempts: result.attempts } : {})
       });
     }
 
-    const html = await r.text();
-
-    // halaman challenge Cloudflare kadang tetap berstatus 200
-    if (/Just a moment|challenge-platform|cf-chl/i.test(html.slice(0, 3000))) {
-      console.log('sokuja detail: challenge Cloudflare terdeteksi');
-      return send(503, {
-        status: 'error',
-        creator: 'hiru404',
-        message: 'Sumber menampilkan challenge Cloudflare. Gunakan SCRAPER_KEY atau PROXY_URL.'
-      });
-    }
-
-    const $ = load(html);
+    const $ = load(result.html);
     const main = $('#main-content').first().length ? $('#main-content').first() : $('body');
     const h1 = main.find('h1').first();
     if (!h1.length) {
       return send(502, {
         status: 'error',
         creator: 'hiru404',
-        message: 'Detail anime tidak ditemukan. Struktur halaman Sokuja mungkin berubah.'
+        message: 'Detail anime tidak ditemukan. Struktur halaman Sokuja mungkin berubah.',
+        ...(debug ? { attempts: result.attempts } : {})
       });
     }
 
@@ -250,6 +304,7 @@ export default async function handler(req, res) {
       status: 'success',
       creator: 'hiru404',
       source: 'Sokuja',
+      ...(debug ? { via: result.via, attempts: result.attempts } : {}),
       detail: {
         title,
         slug,
