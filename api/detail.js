@@ -1,6 +1,6 @@
 import { load } from 'cheerio';
 
-const BASE = 'https://animasu.love';
+const BASE = 'https://x6.sokuja.uk';
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -38,7 +38,7 @@ const fetchSource = (slug) => {
 
 const clean = (s = '') => s.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
 
-// https://animasu.love/genre/harem/ -> harem
+// /genre/harem/ -> harem
 const slugFromUrl = (href = '') => {
   try {
     const parts = new URL(href, BASE).pathname.split('/').filter(Boolean);
@@ -48,17 +48,31 @@ const slugFromUrl = (href = '') => {
   }
 };
 
-// teks span tanpa label <b>Label:</b>
-const valueOf = ($, span) => {
-  const c = $(span).clone();
-  c.find('b').first().remove();
-  return clean(c.text());
+// /_next/image/?url=%2Fuploads%2F...webp&w=3840&q=75 -> https://x6.sokuja.uk/uploads/...webp
+const imgUrl = (src = '') => {
+  if (!src) return '';
+  try {
+    const u = new URL(src, BASE);
+    if (u.pathname.startsWith('/_next/image')) {
+      const orig = u.searchParams.get('url');
+      if (orig) return new URL(orig, BASE).href;
+    }
+    return u.href;
+  } catch {
+    return '';
+  }
 };
 
-// daftar link (genre, studio, musim) -> [{ name, slug }]
-const linksOf = ($, span) =>
-  $(span).find('a[rel="tag"]').map((_, a) => ({
-    name: clean($(a).text()),
+// cari section berdasarkan teks <h2>
+const sectionOf = ($, re) => {
+  const h2 = $('h2').filter((_, el) => re.test(clean($(el).text()))).first();
+  return h2.length ? h2 : null;
+};
+
+// daftar link di dalam <dd> -> [{ name, slug }]
+const linksOf = ($, dd) =>
+  $(dd).find('a').map((_, a) => ({
+    name: clean($(a).text()).replace(/,$/, ''),
     slug: slugFromUrl($(a).attr('href'))
   })).get().filter(x => x.name);
 
@@ -81,7 +95,7 @@ export default async function handler(req, res) {
 
     if (!r.ok) {
       const body = (await r.text()).slice(0, 300);
-      console.log('animasu detail', r.status, 'server:', r.headers.get('server'), 'body:', body);
+      console.log('sokuja detail', r.status, 'server:', r.headers.get('server'), 'body:', body);
 
       const blocked = r.status === 403 || r.status === 503;
       return send(r.status, {
@@ -95,9 +109,8 @@ export default async function handler(req, res) {
 
     const html = await r.text();
 
-    // halaman challenge Cloudflare kadang tetap berstatus 200
     if (/Just a moment|challenge-platform|cf-chl/i.test(html.slice(0, 3000))) {
-      console.log('animasu detail: challenge Cloudflare terdeteksi');
+      console.log('sokuja detail: challenge Cloudflare terdeteksi');
       return send(503, {
         status: 'error',
         creator: 'hiru404',
@@ -106,82 +119,43 @@ export default async function handler(req, res) {
     }
 
     const $ = load(html);
-    const big = $('.bigcontent').first();
-    if (!big.length) {
+    const main = $('#main-content').first().length ? $('#main-content').first() : $('body');
+    const h1 = main.find('h1').first();
+    if (!h1.length) {
       return send(502, {
         status: 'error',
         creator: 'hiru404',
-        message: 'Detail anime tidak ditemukan. Struktur halaman Animasu mungkin berubah.'
+        message: 'Detail anime tidak ditemukan. Struktur halaman Sokuja mungkin berubah.'
       });
     }
 
-    const title = clean(big.find('h1[itemprop="headline"], h1').first().text()).replace(/\s*Sub Indo$/i, '');
-    const alt_title = clean(big.find('.alter').first().text());
-    const poster =
-      big.find('.thumb img').first().attr('src') ||
-      big.find('.thumb meta[itemprop="url"]').attr('content') ||
-      '';
-    const description = clean(big.find('.sepele').first().text());
+    // ===== judul =====
+    const title = clean(h1.text()).replace(/\s*Subtitle Indonesia$/i, '');
+    const alt_title = clean(h1.next('p').text());
 
-    // sinopsis asli (kalau ada di luar .bigcontent)
-    const synopsis = clean($('.synp .entry-content, .synp').first().text());
+    // ===== gambar =====
+    const banner = imgUrl(main.find('img').first().attr('src'));
+    const poster = imgUrl(main.find('.flex-shrink-0 img').first().attr('src')) || banner;
 
-    // info dari .spe, dipetakan berdasarkan label <b>
+    // ===== badge di poster (TV / Ongoing) & bookmark =====
+    const badges = main.find('.flex-shrink-0 .absolute span').map((_, el) => clean($(el).text())).get();
+    const bookmarkBtn = main.find('button').filter((_, el) => /Bookmark/i.test($(el).text())).first();
+    const bookmarks = parseInt(clean(bookmarkBtn.find('span').last().text()), 10);
+
+    // ===== rating =====
+    const ratingText = main.find('span.text-2xl').map((_, el) => clean($(el).text())).get()
+      .find(t => /^\d+(\.\d+)?$/.test(t));
+    const rating = ratingText ? parseFloat(ratingText) : null;
+
+    // ===== genre =====
+    const genres = main.find('a[href^="/genre/"]').map((_, a) => ({
+      name: clean($(a).text()),
+      slug: slugFromUrl($(a).attr('href'))
+    })).get();
+
+    // ===== informasi anime (dl > div > dt + dd) =====
     const info = {};
-    big.find('.spe > span').each((_, el) => {
-      const label = clean($(el).find('b').first().text()).replace(/:$/, '').toLowerCase();
-      if (!label) return;
-
-      if (label === 'genre') info.genres = linksOf($, el);
-      else if (label === 'studio') info.studio = linksOf($, el);
-      else if (label === 'musim') info.season = linksOf($, el)[0] || null;
-      else if (label === 'status') info.status = valueOf($, el);
-      else if (label === 'rilis') info.released = valueOf($, el);
-      else if (label === 'jenis') info.type = valueOf($, el);
-      else if (label === 'episode') info.total_episode = valueOf($, el);
-      else if (label === 'durasi') info.duration = valueOf($, el);
-      else if (label === 'diposting') info.posted_by = valueOf($, el);
-      else if (label === 'diupdate') info.updated = valueOf($, el);
-    });
-
-    const ratingText = clean(big.find('.rating strong').first().text());
-    const ratingNum = parseFloat((ratingText.match(/[\d.]+/) || [''])[0]);
-    const rating = Number.isNaN(ratingNum) ? null : ratingNum;
-
-    const id = big.find('.bookmark').attr('data-id') || '';
-    const dateModified = big.find('time[itemprop="dateModified"]').attr('datetime') || '';
-
-    // daftar episode
-    const episodes = [];
-    $('.lchx').each((_, el) => {
-      const a = $(el).find('a').first();
-      const href = a.attr('href') || '';
-      const epTitle = clean(a.text());
-      const epSlug = slugFromUrl(href);
-      if (!epTitle || !epSlug) return;
-      episodes.push({ title: epTitle, slug: epSlug });
-    });
-
-    res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate');
-    send(200, {
-      status: 'success',
-      creator: 'hiru404',
-      source: 'Animasu',
-      detail: {
-        id,
-        title,
-        slug,
-        alt_title,
-        poster,
-        rating,
-        description,
-        synopsis,
-        ...info,
-        updated_at: dateModified,
-        episodes
-      }
-    });
-  } catch (e) {
-    send(500, { status: 'error', creator: 'hiru404', message: e.message });
-  }
-}
+    main.find('dl > div').each((_, el) => {
+      const label = clean($(el).find('dt').first().text()).toLowerCase();
+      const dd = $(el).find('dd').first();
+      if (!label
